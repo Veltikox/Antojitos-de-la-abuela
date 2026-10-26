@@ -1,0 +1,76 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createApp } from '../server.js';
+
+test('Registro, pedidos, stock, edición, concurrencia y persistencia', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'antojitos-'));
+  const path = join(dir, 'shop.sqlite');
+  let server = createApp(path);
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  let base = `http://127.0.0.1:${server.address().port}`;
+  t.after(async () => { await new Promise(resolve => server.close(resolve)); rmSync(dir, { recursive: true, force: true }); });
+  async function request(route, method = 'GET', data, cookie) {
+    const response = await fetch(base + route, { method, headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}) }, ...(data ? { body: JSON.stringify(data) } : {}) });
+    return { status: response.status, data: await response.json(), cookie: response.headers.get('set-cookie')?.split(';')[0] };
+  }
+  const initial = await request('/api/products');
+  assert.equal(initial.data.length, 5);
+  assert.deepEqual(initial.data.map(p => p.price), [150, 200, 120, 160, 220]);
+  assert.ok(initial.data.every(p => p.stock === 30));
+  assert.equal((await request('/api/orders', 'POST', { items: [{ id: 1, quantity: 1 }] })).status, 401);
+  const profile = { name: 'Cliente de prueba', email: 'cliente@example.com', phone: '5551234567', password: 'PruebaSegura123' };
+  const registered = await request('/api/register', 'POST', profile);
+  assert.equal(registered.status, 200);
+  assert.ok(!JSON.stringify(registered.data).includes('password'));
+  const cookie = registered.cookie;
+  assert.equal((await request('/api/me', 'GET', null, cookie)).data.customer.name, profile.name);
+  assert.equal((await request('/api/register', 'POST', profile)).status, 409);
+  assert.equal((await request('/api/login', 'POST', { ...profile, password: 'incorrecta123' })).status, 401);
+  const login = await request('/api/login', 'POST', profile);
+  assert.equal(login.status, 200);
+  const other = await request('/api/register', 'POST', { ...profile, email: 'otro@example.com' });
+  const ordered = await request('/api/orders', 'POST', { items: [{ id: 1, quantity: 2 }, { id: 3, quantity: 1 }] }, cookie);
+  assert.equal(ordered.status, 201);
+  assert.equal(ordered.data.total, 420);
+  assert.equal((await request('/api/products')).data[0].stock, 28);
+  const id = ordered.data.id;
+  const route = `/api/orders/${id}`;
+  assert.equal((await request(route, 'PUT', { version: 1, items: [{ id: 1, quantity: 30 }] }, other.cookie)).status, 404);
+  assert.equal((await request(route, 'PUT', { version: 1, items: [{ id: 1, quantity: 31 }] }, cookie)).status, 409);
+  assert.equal((await request('/api/products')).data[0].stock, 28, 'Una edición fallida no altera el stock');
+  const edited = await request(route, 'PUT', { version: 1, items: [{ id: 1, quantity: 30 }] }, cookie);
+  assert.equal(edited.status, 200);
+  assert.equal(edited.data.version, 2);
+  assert.equal(edited.data.total, 4500);
+  assert.equal((await request('/api/products')).data[0].stock, 0);
+  assert.equal((await request('/api/products')).data[2].stock, 30, 'Restituye el producto eliminado');
+  assert.equal((await request(route, 'PUT', { version: 1, items: [{ id: 1, quantity: 1 }] }, cookie)).status, 409);
+  assert.equal((await request('/api/orders', 'POST', { items: [{ id: 1, quantity: 1 }] }, other.cookie)).status, 409);
+  for (const invalid of [[], [{ id: 2, quantity: -1 }], [{ id: 2, quantity: 1.5 }], [{ id: 2, quantity: 1 }, { id: 2, quantity: 2 }], [{ id: 99, quantity: 1 }]]) {
+    assert.equal((await request('/api/orders', 'POST', { items: invalid }, cookie)).status, 400);
+  }
+  const races = await Promise.all([cookie, other.cookie].map(c => request('/api/orders', 'POST', { items: [{ id: 2, quantity: 20 }] }, c)));
+  assert.deepEqual(races.map(r => r.status).sort(), [201, 409]);
+  assert.equal((await request('/api/products')).data[1].stock, 10);
+  assert.equal((await request(route, 'PUT', { version: 2, items: [{ id: 1, quantity: 1 }] }, cookie)).status, 200);
+  assert.equal((await request('/api/products')).data[0].stock, 29);
+  const history = await request('/api/orders', 'GET', null, cookie);
+  assert.ok(history.data.every(order => order.customer_id === registered.data.customer.id));
+  const hostile = await fetch(base + '/api/logout', { method: 'POST', headers: { Origin: 'https://otra-web.example', 'Content-Type': 'application/json', Cookie: cookie }, body: '{}' });
+  assert.equal(hostile.status, 403);
+  assert.equal((await request('/api/logout', 'POST', {}, login.cookie)).status, 200);
+  assert.equal((await request('/api/me', 'GET', null, login.cookie)).data.customer, null);
+  await new Promise(resolve => server.close(resolve));
+  server = createApp(path);
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  base = `http://127.0.0.1:${server.address().port}`;
+  assert.equal((await request('/api/products')).data[0].stock, 29, 'El reinicio conserva el inventario');
+  assert.equal((await request('/api/orders', 'GET', null, cookie)).data.find(o => o.id === id).version, 3);
+  const html = await fetch(base + '/');
+  assert.equal(html.status, 200);
+  assert.match(await html.text(), /Nuestros postres/);
+  assert.equal((await fetch(base + '/images/queso.jpg')).status, 200);
+});
